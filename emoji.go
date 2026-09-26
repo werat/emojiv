@@ -4,6 +4,7 @@ import (
 	"bufio"
 	_ "embed"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -15,9 +16,6 @@ var emojiTestTxt string
 
 // maxChoiceOptions is the Jev limit on options per Choice question.
 const maxChoiceOptions = 255
-
-// bucketPreviewNames is how many emoji names describe a bucket in the category question.
-const bucketPreviewNames = 12
 
 type Emoji struct {
 	Char     string `json:"emoji"`
@@ -109,12 +107,66 @@ func buildBuckets(emojis []Emoji) []Bucket {
 
 func describeBucket(subgroup string, list []Emoji) string {
 	var names []string
-	for i, e := range list {
-		if i == bucketPreviewNames {
-			names = append(names, "...")
-			break
+	seen := map[string]bool{}
+	for _, e := range list {
+		name := baseName(e.Name)
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
 		}
-		names = append(names, e.Name)
 	}
 	return fmt.Sprintf("%s (%s): %s", strings.ReplaceAll(subgroup, "-", " "), list[0].Group, strings.Join(names, ", "))
+}
+
+var (
+	personWords = map[string]string{
+		"man": "person", "woman": "person", "person": "person",
+		"men": "people", "women": "people", "people": "people",
+	}
+	familyMembers = map[string]bool{
+		"man": true, "woman": true, "person": true, "adult": true,
+		"boy": true, "girl": true, "child": true,
+	}
+	// A dropped leading person word would leave a dangling "in tuxedo" or "with veil".
+	keepPersonBefore = map[string]bool{"with": true, "in": true, "wearing": true}
+	// "woman and man holding hands" means the same as "people holding hands".
+	mixedCouple = regexp.MustCompile(`\b(man|woman) and (man|woman)\b`)
+)
+
+// baseName strips gender and direction variants from an emoji name so that e.g.
+// "student", "man student" and "woman student" all describe the bucket as "student".
+func baseName(name string) string {
+	name = strings.TrimSuffix(name, " facing right")
+	if head, tail, ok := strings.Cut(name, ": "); ok {
+		if head == "flag" {
+			return tail // the bucket is already labeled "country flag"
+		}
+		if _, isPerson := personWords[head]; isPerson {
+			return tail // "man: beard" -> "beard"
+		}
+		all := true
+		for _, m := range strings.Split(tail, ", ") {
+			all = all && familyMembers[m]
+		}
+		if all {
+			return head // "family: man, woman, boy" -> "family"
+		}
+		return name
+	}
+	name = mixedCouple.ReplaceAllString(name, "people")
+
+	words := strings.Fields(name)
+	var out []string
+	for i, w := range words {
+		neutral, isPerson := personWords[w]
+		if !isPerson {
+			out = append(out, w)
+			continue
+		}
+		if i == len(words)-1 || keepPersonBefore[words[i+1]] {
+			out = append(out, neutral) // "deaf man" -> "deaf person", "man in tuxedo" -> "person in tuxedo"
+		}
+		// Otherwise drop it: "man student" -> "student".
+	}
+	return strings.Join(out, " ")
 }
