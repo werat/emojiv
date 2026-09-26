@@ -27,3 +27,8 @@ category, which hid every other association.) Results are cached in memory per q
 Endpoints: `GET /api/search?q=&n=&raw=1`, `GET /api/request?q=` (shows the Jev request body).
 Emoji data: `data/emoji-test.txt` from unicode.org (fully-qualified, skin tones excluded).
 To update it to the latest Unicode release, run `go generate`, which downloads it again.
+
+## License
+
+MIT, see [LICENSE](LICENSE). `data/emoji-test.txt` is Unicode data, distributed under the
+[Unicode License](https://www.unicode.org/terms_of_use.html).
