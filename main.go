@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,6 +21,9 @@ import (
 var staticFS embed.FS
 
 const (
+	backendJev   = "jev"
+	backendEmbed = "embed"
+
 	relatedPrefix   = "related:"
 	bucketPrefix    = "bucket:"
 	maxCacheEntries = 1000
@@ -37,7 +41,8 @@ const (
 
 type Server struct {
 	model   string
-	jev     *JevClient
+	jev     *JevClient // nil when TYPESAFE_API_KEY is not set
+	embed   *Embedder  // nil when no embedding model is configured
 	buckets []Bucket
 
 	mu    sync.Mutex
@@ -50,6 +55,9 @@ type Result struct {
 	Prob       float64 `json:"prob"`
 	BucketProb float64 `json:"bucket_prob"`
 	CondProb   float64 `json:"cond_prob"`
+	// Embed backend only: which vector matched, and the collapsed variants.
+	Match    string   `json:"match,omitempty"`
+	Variants []string `json:"variants,omitempty"`
 }
 
 type BucketProb struct {
@@ -65,6 +73,10 @@ type Debug struct {
 	Model          string       `json:"model"`
 	Cached         bool         `json:"cached"`
 	JevLatencyMs   float64      `json:"jev_latency_ms"`
+	EmbedLatencyMs float64      `json:"embed_latency_ms,omitempty"`
+	EmbedDim       int          `json:"embed_dim,omitempty"`
+	QueryTokens    int          `json:"query_tokens,omitempty"`
+	NumGroups      int          `json:"num_groups,omitempty"`
 	TotalLatencyMs float64      `json:"total_latency_ms"`
 	Usage          JevUsage     `json:"usage"`
 	NumQuestions   int          `json:"num_questions"`
@@ -75,6 +87,7 @@ type Debug struct {
 }
 
 type SearchResponse struct {
+	Backend string   `json:"backend"`
 	Input   string   `json:"input"`
 	Query   string   `json:"query"`
 	Results []Result `json:"results"`
@@ -150,9 +163,22 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	wantRaw := r.URL.Query().Get("raw") == "1"
 
-	out := SearchResponse{Input: raw, Query: query, Results: []Result{}}
+	backend := r.URL.Query().Get("backend")
+	if backend == "" {
+		backend = s.backends()[0]
+	}
+	if !slices.Contains(s.backends(), backend) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "backend not configured: " + backend})
+		return
+	}
+
+	out := SearchResponse{Backend: backend, Input: raw, Query: query, Results: []Result{}}
 	if query == "" {
 		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	if backend == backendEmbed {
+		s.searchEmbed(w, &out, n, start)
 		return
 	}
 
@@ -221,6 +247,53 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// searchEmbed ranks emoji by embedding similarity; Prob holds the cosine similarity.
+// Variants of one concept are collapsed into its best-matching emoji.
+func (s *Server) searchEmbed(w http.ResponseWriter, out *SearchResponse, n int, start time.Time) {
+	embedStart := time.Now()
+	hits, queryTokens, err := s.embed.Search(out.Query)
+	if err != nil {
+		log.Printf("embed search %q: %v", out.Query, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	embedLatency := time.Since(embedStart)
+
+	for _, h := range hits[:min(n, len(hits))] {
+		res := Result{Emoji: h.Emoji, Bucket: h.Emoji.Subgroup, Prob: float64(h.Score), Match: h.Match}
+		for _, v := range h.Variants {
+			res.Variants = append(res.Variants, v.Char)
+		}
+		out.Results = append(out.Results, res)
+	}
+	out.Debug = Debug{
+		Model:          s.embed.ModelName,
+		EmbedLatencyMs: ms(embedLatency),
+		EmbedDim:       s.embed.Dim,
+		QueryTokens:    queryTokens,
+		TotalLatencyMs: ms(time.Since(start)),
+		NumEmojis:      len(s.embed.emojis),
+		NumGroups:      len(hits),
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// backends lists the configured search backends, default first.
+func (s *Server) backends() []string {
+	var out []string
+	if s.jev != nil {
+		out = append(out, backendJev)
+	}
+	if s.embed != nil {
+		out = append(out, backendEmbed)
+	}
+	return out
+}
+
+func (s *Server) handleBackends(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.backends())
+}
+
 // handleRequestPreview returns the Jev request body that a query would produce.
 func (s *Server) handleRequestPreview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.buildRequest(normalizeQuery(r.URL.Query().Get("q"))))
@@ -247,19 +320,28 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func main() {
 	addr := flag.String("addr", "localhost:8080", "listen address")
 	model := flag.String("model", "jev-latest", "Jev model name")
+	embedModel := flag.String("embed-model", "", "path to an EmbeddingGemma 2 GGUF file; enables the embed backend")
+	llamaLib := flag.String("llama-lib", os.Getenv("YZMA_LIB"), "directory with the llama.cpp shared libraries (default $YZMA_LIB)")
 	flag.Parse()
-
-	apiKey := os.Getenv("TYPESAFE_API_KEY")
-	if apiKey == "" {
-		log.Fatal("TYPESAFE_API_KEY is not set")
-	}
 
 	emojis := loadEmojis()
 	s := &Server{
 		model:   *model,
-		jev:     &JevClient{APIKey: apiKey, HTTP: &http.Client{Timeout: 30 * time.Second}},
 		buckets: buildBuckets(emojis),
 		cache:   map[string]*JevResponse{},
+	}
+	if apiKey := os.Getenv("TYPESAFE_API_KEY"); apiKey != "" {
+		s.jev = &JevClient{APIKey: apiKey, HTTP: &http.Client{Timeout: 30 * time.Second}}
+	}
+	if *embedModel != "" {
+		embedder, err := NewEmbedder(*llamaLib, *embedModel, emojis)
+		if err != nil {
+			log.Fatalf("embed backend: %v", err)
+		}
+		s.embed = embedder
+	}
+	if len(s.backends()) == 0 {
+		log.Fatal("no backend configured: set TYPESAFE_API_KEY and/or pass -embed-model")
 	}
 
 	static, _ := fs.Sub(staticFS, "static")
@@ -267,8 +349,9 @@ func main() {
 	mux.Handle("GET /", http.FileServerFS(static))
 	mux.HandleFunc("GET /api/search", s.handleSearch)
 	mux.HandleFunc("GET /api/request", s.handleRequestPreview)
+	mux.HandleFunc("GET /api/backends", s.handleBackends)
 
-	log.Printf("loaded %d emoji in %d buckets; model=%s", len(emojis), len(s.buckets), *model)
+	log.Printf("loaded %d emoji in %d buckets; backends=%v", len(emojis), len(s.buckets), s.backends())
 	log.Printf("listening on http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }

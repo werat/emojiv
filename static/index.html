@@ -74,6 +74,13 @@
         gap: 6px;
         align-items: center;
       }
+      select {
+        padding: 4px;
+        background: var(--card);
+        color: var(--fg);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+      }
       input[type="number"] {
         width: 60px;
         padding: 4px;
@@ -206,6 +213,7 @@
           autocomplete="off"
           autofocus
         />
+        <label>backend <select id="backend"></select></label>
         <label
           >top N <input id="n" type="number" min="1" max="100" value="10"
         /></label>
@@ -219,11 +227,10 @@
         <div class="meta" id="meta"></div>
 
         <h2>Top emoji</h2>
-        <p class="hint">
-          score = P(category related) × P(emoji | category).
-        </p>
+        <p class="hint" id="score-hint"></p>
         <div class="table-wrap"><table id="results-table"></table></div>
 
+        <div id="jev-only">
         <h2>Categories</h2>
         <p class="hint">
           P(related) from each category's <code>related:*</code> Noul question
@@ -242,6 +249,7 @@
         <div id="raw-section" hidden>
           <h2>Raw Jev response</h2>
           <pre id="raw"></pre>
+        </div>
         </div>
       </section>
     </main>

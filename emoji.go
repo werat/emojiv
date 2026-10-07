@@ -18,10 +18,11 @@ var emojiTestTxt string
 const maxChoiceOptions = 255
 
 type Emoji struct {
-	Char     string `json:"emoji"`
-	Name     string `json:"name"`
-	Group    string `json:"group"`
-	Subgroup string `json:"subgroup"`
+	Char     string   `json:"emoji"`
+	Name     string   `json:"name"`
+	Group    string   `json:"group"`
+	Subgroup string   `json:"subgroup"`
+	Keywords []string `json:"keywords,omitempty"` // from CLDR, without the name itself
 }
 
 // Bucket is a set of emoji asked about in a single Choice question.
@@ -34,8 +35,9 @@ type Bucket struct {
 }
 
 // loadEmojis parses Unicode's emoji-test.txt, keeping fully-qualified emoji
-// without skin tone variants.
+// without skin tone variants, and attaches CLDR keywords.
 func loadEmojis() []Emoji {
+	keywords := loadKeywords()
 	var out []Emoji
 	var group, subgroup string
 	sc := bufio.NewScanner(strings.NewReader(emojiTestTxt))
@@ -68,9 +70,28 @@ func loadEmojis() []Emoji {
 		if strings.Contains(name, "skin tone") {
 			continue
 		}
-		out = append(out, Emoji{Char: fields[0], Name: name, Group: group, Subgroup: subgroup})
+		e := Emoji{Char: fields[0], Name: name, Group: group, Subgroup: subgroup}
+		for _, kw := range keywords[keywordKey(e.Char)] {
+			if kw != name {
+				e.Keywords = append(e.Keywords, kw)
+			}
+		}
+		out = append(out, e)
 	}
 	return out
+}
+
+// variantKey groups emoji that are variants of one concept, such as the gendered
+// forms of a profession, the family compositions, or the 24 clock faces. Search
+// results show only the best match of each group.
+func variantKey(e Emoji) string {
+	switch {
+	case strings.HasPrefix(e.Name, "flag: "):
+		return e.Name // baseName would reduce it to the bare country name
+	case e.Subgroup == "time" && (strings.HasSuffix(e.Name, " o’clock") || strings.HasSuffix(e.Name, "-thirty")):
+		return "clock face"
+	}
+	return baseName(e.Name)
 }
 
 func buildBuckets(emojis []Emoji) []Bucket {
